@@ -41,8 +41,11 @@ kernel is only split out into a throwaway stage to feed `--kernel-dir`.
 
 1. **rootfs** *(the measured tree)* — upgrade bootc, swap `bootupd` →
    `systemd-boot-unsigned`, add `systemd-ukify`, drop in the sealing scripts,
-   ship `setup-root-conf.toml` (**transient `/etc`**, see below), and
-   **regenerate the initramfs with the `bootc` (51bootc) dracut module**.
+   ship a **`rw` kernel arg** (`kargs.d/00-rootfs-rw.toml` — required, since a
+   UKI's cmdline is sealed at build time and `bootc install` can't add `rw`
+   like it does for BLS boots; without it the physical root and `/var` mount
+   read-only), ship `setup-root-conf.toml` (**transient `/etc`**, see below),
+   and **regenerate the initramfs with the `bootc` (51bootc) dracut module**.
    That module ships `bootc-root-setup.service`, which at boot mounts the
    composefs root and sets up `/etc` + the `/var` bind-mount; without
    regenerating it the stock initramfs leaves `/etc` and `/var` read-only and

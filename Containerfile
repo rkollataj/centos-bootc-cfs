@@ -72,10 +72,15 @@ COPY seal-uki finalize-uki /usr/bin/
 # services fail (logind, sshd-keygen, NetworkManager, random-seed, ...). Must
 # run AFTER the bootc upgrade and BEFORE the kernel is split into the UKI.
 #
+# REQUIRED: /usr/lib/bootc/kargs.d/00-rootfs-rw.toml adds `rw` to the UKI
+# cmdline. For BLS boots `bootc install` injects `root=UUID=… rw`, but a UKI's
+# cmdline is sealed at build time and install won't touch it, so without `rw`
+# the physical root mounts read-only and /var (a bind from it) is read-only —
+# breaking logind, sshd-keygen, etc. (ukify embeds all of kargs.d.)
+#
 # TEST-ONLY conveniences (remove for production):
 #   * /usr/lib/bootc/kargs.d/10-console.toml adds console=ttyS0 so `virsh
-#     console` shows boot output and a login prompt (ukify embeds kargs.d into
-#     the UKI cmdline).
+#     console` shows boot output and a login prompt.
 #   * `chpasswd` sets root's password to "root" for console login. Swap this
 #     for an authorized SSH key if you prefer `bcvk libvirt ssh` (see README).
 #
@@ -104,6 +109,8 @@ RUN set -eu; \
     rm -rf /var/cache/* /var/lib/dnf /var/lib/rhsm /var/log/* /run/* /tmp/* \
            /var/roothome/buildinfo; \
     mkdir -p /usr/lib/bootc/kargs.d; \
+    printf 'kargs = ["rw"]\n' \
+        > /usr/lib/bootc/kargs.d/00-rootfs-rw.toml; \
     printf 'kargs = ["console=tty0", "console=ttyS0,115200n8"]\n' \
         > /usr/lib/bootc/kargs.d/10-console.toml; \
     echo 'root:root' | chpasswd; \
