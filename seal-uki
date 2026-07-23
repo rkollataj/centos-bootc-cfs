@@ -1,0 +1,88 @@
+#!/bin/bash
+# Generate a sealed UKI with embedded composefs digest
+set -xeuo pipefail
+
+missing_verity=()
+
+while [ ! -z "${1:-}" ]; do
+    case "$1" in
+        # Path to the desired root filesystem
+        "--target")
+            target="$2"
+            shift
+            shift
+        ;;
+
+        # Write to this directory
+        "--output")
+            output="$2"
+            shift
+            shift
+        ;;
+
+        # Path to secrets directory
+        "--secrets")
+            secrets="$2"
+            shift
+            shift
+        ;;
+
+        "--allow-missing-verity")
+            missing_verity=(--allow-missing-verity)
+            shift
+        ;;
+
+        "--seal-state")
+            seal_state="$2"
+            shift
+            shift
+        ;;
+
+        # Path to the directory containing kernel and initramfs
+        "--kernel-dir")
+            kernel_dir="$2"
+            shift
+            shift
+        ;;
+
+        * )
+            echo "Argument $1 not understood"
+            exit 1
+        ;;
+    esac
+done
+
+if [[ $seal_state == "sealed" && ${#missing_verity[@]} -gt 0 ]]; then
+    echo "Cannot have missing verity with sealed UKI" >&2
+    exit 1
+fi
+
+if [[ -z $kernel_dir ]]; then
+    echo "kernel dir is required" >&2
+    exit 1
+fi
+
+kernel_params=(--kernel-dir "$kernel_dir")
+
+kver=$(basename "$kernel_dir")
+
+mkdir -p "${output}"
+
+# Baseline ukify options
+ukifyargs=(--measure
+           --json pretty
+           --output "${output}/${kver}.efi")
+
+if [[ $seal_state == "sealed" ]]; then
+    # Signing options, we use sbsign by default
+    ukifyargs+=(--signtool sbsign
+                --secureboot-private-key "${secrets}/secureboot_key"
+                --secureboot-certificate "${secrets}/secureboot_cert")
+fi
+
+# Baseline container ukify options
+containerukifyargs=(--rootfs "${target}")
+
+# Build the UKI using bootc container ukify
+# This computes the composefs digest, reads kargs from kargs.d, and invokes ukify
+bootc container ukify "${containerukifyargs[@]}" "${kernel_params[@]}" "${missing_verity[@]}" -- "${ukifyargs[@]}"
