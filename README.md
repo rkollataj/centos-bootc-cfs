@@ -1,93 +1,154 @@
-# centos-bootc-cfs
+# Minimal CentOS Stream 10 bootc — sealed composefs UKI (unsigned)
 
+A minimal [bootc](https://bootc.dev) base image on CentOS Stream 10 using the
+experimental **composefs** backend, booted from a **sealed UKI** (Unified Kernel
+Image). Image signing is skipped, so no keys are required.
 
+- **Sealed:** the composefs digest of the root filesystem is computed at build
+  time, baked into the UKI kernel command line (`composefs=<sha512>`), and
+  *enforced at boot*. If the root fs doesn't match, it won't boot.
+- **Unsigned:** the UKI itself carries no Secure Boot signature. That only
+  removes firmware verification of the UKI; the root-fs fsverity seal is still
+  enforced. See [docs](https://bootc.dev/bootc/experimental-composefs.html#using-without-secure-boot).
+- **Transient `/etc`:** the seal only covers the read-only base image, not the
+  writable `/etc`/`/var`. This image sets `/etc` to a **tmpfs overlay**
+  (`/usr/lib/composefs/setup-root-conf.toml`, `[etc] transient = true`), so any
+  runtime change to `/etc` is discarded on reboot — the writable overlay can't
+  accumulate persistent tampering; `/etc` always resets to the sealed baseline.
+  Consequence: files normally generated on first boot (SSH host keys,
+  `machine-id`) regenerate every boot, so SSH clients will see the host key
+  change between reboots. Persistent per-machine config must be baked into the
+  image or stored under `/var` (which stays a persistent bind-mount). Remove
+  the `setup-root-conf.toml` line to get a normal persistent `/etc`.
 
-## Getting started
+## Build
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```sh
+podman build -f Containerfile -t localhost/centos-bootc-composefs:stream10 .
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/pesabydgoszczsa/test-lab/centos-bootc-cfs.git
-git branch -M master
-git push -uf origin master
+
+With Docker/buildx the same file works (it uses `RUN` heredocs and bind mounts).
+
+## How it works
+
+This mirrors bootc's own maintained sealed-UKI recipe (its repo-root
+`Dockerfile` + `contrib/packaging/{seal-uki,finalize-uki}`, vendored here as
+`seal-uki` / `finalize-uki`) rather than the prose docs' split-then-copy
+pattern — the latter produces a build-time vs install-time composefs digest
+mismatch ("The UKI has the wrong composefs= parameter ..."). The critical
+difference: the **measured** rootfs keeps its kernel in `/usr/lib/modules`; the
+kernel is only split out into a throwaway stage to feed `--kernel-dir`.
+
+1. **rootfs** *(the measured tree)* — upgrade bootc, swap `bootupd` →
+   `systemd-boot-unsigned`, add `systemd-ukify`, drop in the sealing scripts,
+   ship `setup-root-conf.toml` (**transient `/etc`**, see below), and
+   **regenerate the initramfs with the `bootc` (51bootc) dracut module**.
+   That module ships `bootc-root-setup.service`, which at boot mounts the
+   composefs root and sets up `/etc` + the `/var` bind-mount; without
+   regenerating it the stock initramfs leaves `/etc` and `/var` read-only and
+   most services fail. Kernel is **not** split here.
+2. **kernel** — `bootc container split-kernel-and-rootfs` into `/kernel/<kver>/`;
+   only this directory is consumed (as `--kernel-dir`). Never measured/shipped.
+3. **sealed-uki** — `seal-uki` runs `bootc container ukify` against the measured
+   rootfs, embedding the composefs digest, unsigned (`--seal-state unsealed`).
+4. **final** — `FROM rootfs` (same measured tree) + `finalize-uki` copies the
+   UKI to `/boot/EFI/Linux/`. `/boot` is excluded from the digest, so the seal
+   stays valid. Then `bootc container lint`.
+
+## Requirements / caveats
+
+- **Recent bootc (handled automatically).** The `container ukify` /
+  `split-kernel-and-rootfs` subcommands are experimental and the stream10 base
+  image's bootc is too old for them, so the build upgrades bootc from the
+  `rhcontainerbot/bootc` COPR (via `bootc-copr.repo`). Needs **network access at
+  build time**; the newer bootc also lands in the final image (which the
+  installed system needs for composefs `bootc upgrade`).
+- **Install target needs an fsverity-capable root fs** (ext4 or btrfs). The
+  build is strictly sealed (no `--allow-missing-verity`); on XFS it won't
+  validate. To relax, add `--allow-missing-verity` to the `seal-uki` call in the
+  Containerfile — note that makes the image *unsealed*.
+- **Secure Boot** stays disabled (unsigned). To sign later, change the
+  `sealed-uki` stage to `--seal-state sealed` and mount `secureboot_key` /
+  `secureboot_cert` secrets (see `seal-uki`), passing them via
+  `podman build --secret`.
+- **Directory-mtime normalization.** `bootc container ukify` seals using a
+  *directory read* of the rootfs (real dir mtimes), but `bootc install`
+  recomputes the digest from the *OCI layers* (dir mtimes normalized to 0.0).
+  On rootless/overlay builds these diverge, causing install to fail with
+  "The UKI has the wrong composefs= parameter" (upstream
+  [bootc#1498](https://github.com/bootc-dev/bootc/issues/1498)). The `rootfs`
+  stage works around it by zeroing all directory mtimes as its last step — so
+  **any extra `RUN` you add that creates directories must end with the same
+  `find / -xdev -type d -exec touch -c -m -d @0 {} +`**, or the seal breaks
+  again. `diagnose-digest.sh` compares the two digest views if you need to
+  debug this.
+
+## Run as a local VM (bcvk)
+
+[`bcvk`](https://github.com/bootc-dev/bcvk) installs the image to a disk and
+boots it under libvirt/QEMU — the full firmware → systemd-boot → UKI → composefs
+chain. You **must** pass `--filesystem ext4`: the image is strictly sealed, so
+the root fs needs fsverity, which `ext4` (or `btrfs`) provides but `xfs` — the
+default — does not. Without it the install fails the seal.
+
+```sh
+# persistent VM (installs to a disk, then boots it):
+bcvk libvirt run --name cfs-test --memory 4096 --cpus 2 \
+  --filesystem ext4 \
+  localhost/centos-bootc-composefs:stream10
+
+# manage it afterwards:
+virsh --connect qemu:///session list
+virsh --connect qemu:///session console cfs-test
+virsh --connect qemu:///session destroy cfs-test
+virsh --connect qemu:///session undefine --nvram cfs-test   # remove
 ```
 
-## Integrate with your tools
+Host prerequisites (Arch): `qemu-full libvirt virtiofsd edk2-ovmf dnsmasq`
+(plus `swtpm` only if you later test TPM measured boot).
 
-* [Set up project integrations](https://gitlab.com/pesabydgoszczsa/test-lab/centos-bootc-cfs/-/settings/integrations)
+> `bcvk ephemeral run` is **not** equivalent — it boots the container directly
+> over virtiofs, skipping systemd-boot/UKI/composefs. Use `libvirt run` to
+> exercise the sealed boot chain.
 
-## Collaborate with your team
+## Install to bare metal / a disk
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```sh
+podman run --rm --privileged --pid=host \
+  -v /var/lib/containers:/var/lib/containers \
+  -v /dev:/dev --security-opt label=type:unconfined_t \
+  localhost/centos-bootc-composefs:stream10 \
+  bootc install to-disk --filesystem ext4 /dev/sdX
+```
 
-## Test and Deploy
+Because the image contains a UKI, bootc automatically selects the composefs
+backend during install. Note the same `--filesystem ext4` requirement applies.
 
-Use the built-in continuous integration in GitLab.
+## Updating an installed system
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+The sealed UKI is baked into the image at build time, so **you never re-run
+`ukify` on the machine** — each new image version carries its own freshly
+sealed UKI. `bootc upgrade` pulls the new image, creates a new composefs
+deployment, extracts that image's UKI into the ESP, and writes a BLS entry for
+it. The previous deployment stays for rollback (A/B, reboot to apply).
 
-***
+```sh
+bootc status            # booted / staged / rollback deployments
+bootc upgrade           # pull newest of the current ref, stage for next boot
+bootc upgrade --apply   # ...and reboot to apply
+bootc switch quay.io/you/img:tag   # move to a different image ref
+bootc rollback          # boot the previous deployment again
+```
 
-# Editing this README
+Two requirements:
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+1. **Install from a registry ref, not `localhost/...`.** `bootc install`
+   records the image reference and `bootc upgrade` pulls *that* ref, so build →
+   `podman push quay.io/you/...:stream10` → install from that ref. (If you
+   installed from a local image, run `bootc switch quay.io/you/...:stream10`
+   once to repoint the origin.)
+2. **Rebuild via this Containerfile on every change** (the split + `ukify`
+   stages), so the UKI carries the new rootfs's composefs digest. A plain
+   `dnf update` inside a container without re-sealing would produce a mismatched
+   UKI. Kernel updates are handled automatically (the kernel is re-embedded in
+   each build). If you later add signing, every update's UKI must be signed too.
