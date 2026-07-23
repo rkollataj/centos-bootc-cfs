@@ -78,6 +78,24 @@ COPY seal-uki finalize-uki /usr/bin/
 # the physical root mounts read-only and /var (a bind from it) is read-only —
 # breaking logind, sshd-keygen, etc. (ukify embeds all of kargs.d.)
 #
+# STATELESS /var + PERSISTENT /var/log (reset-proof design):
+#   * systemd.volatile=state -> /var is a fresh tmpfs every boot, so no
+#     persistent writable state can be corrupted by a power loss.
+#   * systemd.mount-extra=/sysroot/state/os/default/var/log:/var/log:none:bind
+#     bind-mounts a persistent directory from the (writable) root partition onto
+#     the tmpfs /var/log, so logs survive reboots WITHOUT needing a separate
+#     partition or disk. That path is bootc's on-disk /var (shared across
+#     deployments, seeded from the image at install); it stays populated even
+#     when the live /var is volatile. We use a mount-extra KARG, not /etc/fstab,
+#     because transient /etc discards fstab (bootc does the same for /boot; see
+#     #1388). `nofail` keeps boot working if the path is ever absent.
+#     NOTE: logs then share the root partition with the composefs store, so we
+#     cap them below. For hardware isolation instead, put /var/log on a
+#     dedicated partition and mount it by LABEL — see README.
+#   * journald Storage=persistent + SystemMaxUse=1G -> logs land in
+#     /var/log/journal on the root partition, capped so they can't fill it.
+#     (Placed in /usr since transient /etc won't keep an /etc drop-in.)
+#
 # TEST-ONLY conveniences (remove for production):
 #   * /usr/lib/bootc/kargs.d/10-console.toml adds console=ttyS0 so `virsh
 #     console` shows boot output and a login prompt.
@@ -113,6 +131,13 @@ RUN set -eu; \
         > /usr/lib/bootc/kargs.d/00-rootfs-rw.toml; \
     printf 'kargs = ["console=tty0", "console=ttyS0,115200n8"]\n' \
         > /usr/lib/bootc/kargs.d/10-console.toml; \
+    printf 'kargs = ["systemd.volatile=state"]\n' \
+        > /usr/lib/bootc/kargs.d/50-var-volatile.toml; \
+    printf 'kargs = ["systemd.mount-extra=/sysroot/state/os/default/var/log:/var/log:none:bind,nofail"]\n' \
+        > /usr/lib/bootc/kargs.d/55-varlog-mount.toml; \
+    mkdir -p /usr/lib/systemd/journald.conf.d; \
+    printf '[Journal]\nStorage=persistent\nSystemMaxUse=1G\n' \
+        > /usr/lib/systemd/journald.conf.d/10-persistent.conf; \
     echo 'root:root' | chpasswd; \
     find / -xdev -type d -exec touch -c -m -d @0 {} + 2>/dev/null || true
 

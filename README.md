@@ -17,9 +17,15 @@ Image). Image signing is skipped, so no keys are required.
   accumulate persistent tampering; `/etc` always resets to the sealed baseline.
   Consequence: files normally generated on first boot (SSH host keys,
   `machine-id`) regenerate every boot, so SSH clients will see the host key
-  change between reboots. Persistent per-machine config must be baked into the
-  image or stored under `/var` (which stays a persistent bind-mount). Remove
-  the `setup-root-conf.toml` line to get a normal persistent `/etc`.
+  change between reboots. Remove the `setup-root-conf.toml` line to get a
+  normal persistent `/etc`.
+- **Stateless `/var`, persistent `/var/log` (reset-proof):** `/var` is a fresh
+  **tmpfs** every boot (`systemd.volatile=state`), so a power loss can't corrupt
+  persistent state — there is none. Logs still persist: `/var/log` is
+  **bind-mounted from a directory on the writable root partition** via a
+  `systemd.mount-extra=` karg (not `/etc/fstab`, which transient `/etc`
+  discards). journald uses `Storage=persistent` with `SystemMaxUse=1G`. No extra
+  partition or disk needed. See **Persistent logs** below.
 
 ## Build
 
@@ -126,6 +132,44 @@ podman run --rm --privileged --pid=host \
 
 Because the image contains a UKI, bootc automatically selects the composefs
 backend during install. Note the same `--filesystem ext4` requirement applies.
+
+## Persistent logs (`/var` stateless, `/var/log` persistent)
+
+`/var` is a fresh **tmpfs** every boot (`systemd.volatile=state`) — reset-proof,
+nothing persistent to corrupt. `/var/log` is made persistent by **bind-mounting
+a directory from the writable root partition** (`/dev/vda3`, mounted at
+`/sysroot`) onto it:
+
+```
+systemd.mount-extra=/sysroot/state/os/default/var/log:/var/log:none:bind,nofail
+```
+
+That source is bootc's on-disk `/var` (shared across deployments, seeded from the
+image at install); it stays populated even while the live `/var` is tmpfs. **No
+extra partition or disk needed — it works on the plain bcvk VM as-is.** journald
+uses `Storage=persistent` with `SystemMaxUse=1G` so logs land in
+`/var/log/journal` and can't fill the root partition.
+
+Verify inside the VM (after a rebuild + recreate):
+
+```sh
+findmnt /var/log            # a bind mount backed by /dev/vda3
+echo hi | systemd-cat ; reboot
+journalctl -b -1 | tail     # previous boot's logs survived
+touch /var/foo              # does NOT survive — /var is tmpfs (by design)
+```
+
+**Tradeoff:** logs share the root partition with the composefs store (not
+isolated). The `SystemMaxUse` cap prevents them filling it. If you later want
+**hardware-level isolation** — `/var/log` on its own filesystem so log I/O and
+corruption can't touch the OS partition — put the log store on a dedicated
+`/var/log` partition/disk (built with `bootc-image-builder`, or pre-created and
+installed via `bootc install to-filesystem`) and change the karg in
+`kargs.d/55-varlog-mount.toml` to mount it by label, e.g.
+`systemd.mount-extra=LABEL=varlog:/var/log:ext4:nofail`.
+
+For real hardware also consider shipping logs off-box (remote journald/syslog)
+as the primary sink, with local `/var/log` as a buffer.
 
 ## Updating an installed system
 
