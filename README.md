@@ -27,6 +27,51 @@ Image). Image signing is skipped, so no keys are required.
   discards). journald uses `Storage=persistent` with `SystemMaxUse=1G`. No extra
   partition or disk needed. See **Persistent logs** below.
 
+## Prerequisites
+
+### To build the image
+
+- **Podman** (or Docker with buildx — the Containerfile uses `RUN` heredocs
+  and bind mounts, supported by either).
+- **Network access at build time** — the build pulls a newer `bootc` from the
+  `rhcontainerbot/bootc` COPR (see **Requirements / caveats** below).
+
+```sh
+# Ubuntu/Debian
+sudo apt install podman
+```
+
+### To run it as a local VM (`bcvk`)
+
+- **[`bcvk`](https://github.com/bootc-dev/bcvk)** — not packaged for apt;
+  install a prebuilt binary from its
+  [releases page](https://github.com/bootc-dev/bcvk/releases) or via
+  `cargo install`.
+- **QEMU + libvirt stack**:
+
+  ```sh
+  sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system \
+      libvirt-clients virtiofsd ovmf dnsmasq-base swtpm
+  ```
+
+  (`swtpm` is optional — only needed if you test TPM-measured boot.)
+- **Group membership**, so you can manage VMs and access `/dev/kvm` without
+  `sudo`:
+  ```sh
+  sudo usermod -aG libvirt,kvm $USER
+  ```
+  Then fully log out and back in (on WSL2: `wsl.exe --shutdown` from Windows,
+  then reopen the terminal) — group changes don't apply to an already-running
+  session.
+- **Rootless `/dev/kvm` access may additionally need `crun` or a udev rule**,
+  depending on your distro's default device permissions — see the note under
+  **Run as a local VM** below.
+
+### To install to bare metal / a disk
+
+Just **Podman**, run privileged with access to `/dev` — see **Install to bare
+metal / a disk** below. No `bcvk`/libvirt/QEMU needed for this path.
+
 ## Build
 
 ```sh
@@ -106,15 +151,57 @@ bcvk libvirt run --name cfs-test --memory 4096 --cpus 2 \
   --filesystem ext4 \
   localhost/centos-bootc-composefs:stream10
 
+# re-create it (replaces an existing VM of the same name):
+bcvk libvirt run --name cfs-test --memory 4096 --cpus 2 \
+  --filesystem ext4 --replace \
+  localhost/centos-bootc-composefs:stream10
+
 # manage it afterwards:
-virsh --connect qemu:///session list
-virsh --connect qemu:///session console cfs-test
-virsh --connect qemu:///session destroy cfs-test
-virsh --connect qemu:///session undefine --nvram cfs-test   # remove
+virsh --connect qemu:///system list
+virsh --connect qemu:///system console cfs-test
+virsh --connect qemu:///system destroy cfs-test
+virsh --connect qemu:///system undefine --nvram cfs-test   # remove
 ```
 
-Host prerequisites (Arch): `qemu-full libvirt virtiofsd edk2-ovmf dnsmasq`
-(plus `swtpm` only if you later test TPM measured boot).
+> **`system` vs `session`:** `bcvk`/`virsh` fall back to whichever libvirt
+> connection their default-URI probe finds first. If the system `libvirtd` is
+> active and you're in the `libvirt` group, that's `qemu:///system` (as above)
+> — otherwise it's the per-user `qemu:///session`. `bcvk libvirt list` finds
+> the domain either way; for `virsh` (or to force one), pass it explicitly,
+> e.g. `virsh --connect qemu:///session list`.
+
+See **Prerequisites** above for the required packages and group membership.
+
+> **Rootless `/dev/kvm` access may need `crun` — or a udev rule.** `bcvk`
+> passes `/dev/kvm` into its installer/runner container via
+> `--group-add=keep-groups` (preserving your host's `kvm` group membership
+> inside the container). Only the **`crun`** OCI runtime honors that flag —
+> `runc` silently ignores it, leaving the container with no `kvm` group. This
+> only matters if `/dev/kvm` is group-restricted on your host (`ls -l
+> /dev/kvm` shows `crw-rw----  root kvm`, mode `0660`) — the default on
+> Debian/Ubuntu. If it's world-accessible instead (`crw-rw-rw-`, mode `0666`
+> — e.g. the default on some distros' `libvirt`/`qemu` udev rules), group
+> membership is irrelevant and `runc` works fine as-is. If you hit `KVM
+> device not accessible` and `ls -l /dev/kvm` shows the restrictive `0660`
+> mode, check `podman info --format '{{.Host.OCIRuntime.Name}}'`; you have
+> two fixes, pick one:
+> - **Install `crun`** and make it podman's default in
+>   `~/.config/containers/containers.conf`:
+>   ```ini
+>   [engine]
+>   runtime = "crun"
+>   ```
+> - **Or keep `runc`** and make `/dev/kvm` world-accessible instead (matches
+>   what some distros ship by default), via a persistent udev rule:
+>   ```sh
+>   echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | \
+>       sudo tee /etc/udev/rules.d/65-kvm-world.rules
+>   sudo udevadm control --reload-rules
+>   sudo udevadm trigger --name-match=kvm
+>   ```
+>   This widens local access to `/dev/kvm` to all users on the machine, not
+>   just the `kvm` group — fine for a single-user workstation/VM/WSL2 box,
+>   worth considering before applying on a shared multi-user host.
 
 > `bcvk ephemeral run` is **not** equivalent — it boots the container directly
 > over virtiofs, skipping systemd-boot/UKI/composefs. Use `libvirt run` to
