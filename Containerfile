@@ -25,10 +25,24 @@
 #     we use `unsealed` = UNSIGNED, so no keys are needed.
 # Net result: an fsverity-sealed, unsigned UKI.
 #
+# KNOWN BUILD-TIME BUG, WORKED AROUND BY `fix-uki-digest.sh`: `bootc container
+# ukify` (in the `sealed-uki` stage) computes its digest via a directory walk
+# of the extracted rootfs; `bootc install` verifies against the raw
+# storage/layer-ingest digest. These can disagree on some directories'
+# mtimes/modes purely from how containers/storage's overlay driver extracts
+# layers onto local disk -- unrelated to this image's content. Open upstream
+# bug: https://github.com/bootc-dev/bootc/issues/2194. `fix-uki-digest.sh`
+# (run automatically by `build.sh`) re-computes the correct digest the same
+# way `bootc install` does and binary-patches it into the built UKI, so the
+# shipped image is genuinely, correctly sealed despite the upstream bug. See
+# README for details.
+#
 # See: https://bootc.dev/bootc/experimental-composefs.html
 #
-# Build (podman):
-#   podman build -f Containerfile -t localhost/centos-bootc-composefs:stream10 .
+# Build:
+#   ./build.sh
+# (equivalent to `podman build -f Containerfile -t <tag> .` followed by
+# `./fix-uki-digest.sh <tag>` -- see README before using plain `podman build`.)
 #
 # Requires network at build time (COPR + gpg key fetch).
 
@@ -149,6 +163,48 @@ RUN set -eu; \
 #     find / -xdev -type d -exec touch -c -m -d @0 {} + 2>/dev/null || true
 
 ########################################################################
+# Qt demo: a fullscreen digital clock rendered via Qt's "eglfs" QPA
+# platform plugin (EGL + DRM/KMS against /dev/dri/card*, software-
+# rendered with Mesa llvmpipe on virtio-gpu) -- no Wayland, no X11, no
+# compositor. Runs as a systemd service so it's visible as soon as the
+# VM's display comes up (see README: "Qt demo app").
+#
+# NOT linuxfb: this kernel (RHEL/CentOS 10) doesn't create a legacy
+# /dev/fb0 device node even though fbcon/virtio_gpudrmfb bind at boot --
+# only DRM/KMS (/dev/dri/card*) is exposed to userspace. eglfs is Qt's
+# modern replacement for framebuffer-only embedded targets anyway.
+#
+# Built here with a throwaway toolchain (gcc-c++/cmake/make and
+# qt6-qtbase-devel) that is dnf-removed in this SAME RUN/layer, so only
+# the qt6-qtbase-gui runtime (which also pulls in the Mesa/EGL/DRM libs
+# eglfs needs), a font, and the compiled binary end up in the final
+# image -- the same "build then strip in one layer" trick as the main
+# RUN above, just scoped to this one add-on.
+#
+# The [Install] symlink is created directly under /usr/lib/systemd/system
+# instead of via `systemctl enable` (which writes to /etc/systemd/system):
+# same reasoning as the journald drop-in above -- transient /etc can't be
+# relied on to hold it, while /usr is part of the sealed, measured tree.
+########################################################################
+COPY qtdemo/ /usr/src/qtdemo/
+RUN set -eu; \
+    dnf -y install qt6-qtbase-gui qt6-qtbase-devel gcc-c++ cmake make \
+        dejavu-sans-fonts; \
+    cmake -S /usr/src/qtdemo -B /usr/src/qtdemo/build -DCMAKE_BUILD_TYPE=Release; \
+    cmake --build /usr/src/qtdemo/build; \
+    install -Dm755 /usr/src/qtdemo/build/qtdemo /usr/bin/qtdemo; \
+    install -Dm644 /usr/src/qtdemo/qt-demo.service \
+        /usr/lib/systemd/system/qt-demo.service; \
+    mkdir -p /usr/lib/systemd/system/multi-user.target.wants; \
+    ln -sf ../qt-demo.service \
+        /usr/lib/systemd/system/multi-user.target.wants/qt-demo.service; \
+    dnf -y remove gcc-c++ cmake make qt6-qtbase-devel; \
+    dnf -y clean all; \
+    rm -rf /usr/src/qtdemo /var/cache/* /var/lib/dnf /var/lib/rhsm /var/log/* \
+           /run/* /tmp/*; \
+    find / -xdev -type d -exec touch -c -m -d @0 {} + 2>/dev/null || true
+
+########################################################################
 # Stage `kernel`: source of --kernel-dir only.
 #
 # Splits vmlinuz/initramfs into /kernel/<kver>/. We consume ONLY its /kernel
@@ -165,6 +221,16 @@ RUN mkdir /kernel && \
 # of --target, embeds it in the cmdline, and invokes ukify. --seal-state
 # unsealed => no Secure Boot signing (no secrets needed). No
 # --allow-missing-verity => the composefs digest is strictly enforced at boot.
+#
+# CAVEAT: the digest `ukify` computes here (a directory walk of the extracted
+# rootfs) is known to disagree with what `bootc install` verifies against (the
+# raw storage/layer-ingest digest) on some images, due to an open upstream bug
+# unrelated to this image's content: containers/storage's overlay driver
+# doesn't preserve some directories' extracted mtimes/modes, and that leaks
+# into ukify's walk. https://github.com/bootc-dev/bootc/issues/2194. This
+# repo's `fix-uki-digest.sh` corrects the embedded digest after build (see
+# README) — `build.sh` runs it automatically. Once the upstream bug is fixed,
+# both should become no-ops.
 ########################################################################
 FROM rootfs AS sealed-uki
 RUN --mount=type=bind,from=rootfs,src=/,target=/run/target \

@@ -1,0 +1,17 @@
+[Unit]
+Description=Qt demo (digital clock, eglfs/KMS -- no Wayland/X11)
+Documentation=https://doc.qt.io/qt-6/embedded-linux.html
+ConditionPathExistsGlob=/dev/dri/card*
+After=local-fs.target systemd-user-sessions.service getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qtdemo -platform eglfs
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
