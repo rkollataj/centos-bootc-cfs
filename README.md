@@ -1,15 +1,15 @@
-# Minimal CentOS Stream 10 bootc — sealed composefs UKI (unsigned)
+# Minimal CentOS Stream 10 bootc — sealed, signed composefs UKI
 
 A minimal [bootc](https://bootc.dev) base image on CentOS Stream 10 using the
-experimental **composefs** backend, booted from a **sealed UKI** (Unified
-Kernel Image). Image signing is skipped, so no keys are required.
+experimental **composefs** backend, booted from a **sealed, Secure
+Boot-signed UKI** (Unified Kernel Image).
 
 - **Sealed:** the composefs digest of the root filesystem is computed at
   build time, baked into the UKI kernel command line (`composefs=<sha512>`),
   and enforced at boot. If the root fs doesn't match, it won't boot.
-- **Unsigned:** the UKI carries no Secure Boot signature. The root-fs
-  fsverity seal is still enforced independently of that. See
-  [docs](https://bootc.dev/bootc/experimental-composefs.html#using-without-secure-boot).
+- **Signed:** the UKI is signed for Secure Boot with a local key/cert pair,
+  generated on first build and gitignored (never committed). See **Secure
+  Boot signing**.
 - **Transient `/etc`:** `/etc` is a tmpfs overlay
   (`/usr/lib/composefs/setup-root-conf.toml`, `[etc] transient = true`), so
   runtime changes are discarded on reboot. SSH host keys and `machine-id`
@@ -28,11 +28,12 @@ Kernel Image). Image signing is skipped, so no keys are required.
 ### To build the image
 
 - **Podman** (or Docker with buildx).
-- **Python 3** on the host — used by `fix-uki-digest.sh`.
-- **Network access at build time** (COPR + gpg key fetch).
+- **OpenSSL** and **Python 3** on the host — used by `gen-secureboot-keys.sh`
+  to generate local Secure Boot keys.
+- **Network access at build time** (COPR + EPEL + gpg key fetches).
 
 ```sh
-sudo apt install podman python3
+sudo apt install podman python3 openssl
 ```
 
 ### To run it as a local VM (`bcvk`)
@@ -40,10 +41,13 @@ sudo apt install podman python3
 - **[`bcvk`](https://github.com/bootc-dev/bcvk)** — install a prebuilt binary
   from its [releases page](https://github.com/bootc-dev/bcvk/releases) or via
   `cargo install`.
-- **QEMU + libvirt stack**:
+- **QEMU + libvirt stack**, plus **`python3-virt-firmware`** (provides
+  `virt-fw-vars`, which `bcvk --secure-boot-keys` uses to enroll the local
+  keys into the VM's firmware):
   ```sh
   sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system \
-      libvirt-clients virtiofsd ovmf dnsmasq-base swtpm virt-viewer
+      libvirt-clients virtiofsd ovmf dnsmasq-base swtpm virt-viewer \
+      python3-virt-firmware
   ```
   (`swtpm` only needed for TPM-measured boot; `virt-viewer` only needed to
   view the Qt demo's graphical output.)
@@ -67,10 +71,12 @@ metal / a disk**. No `bcvk`/libvirt/QEMU needed.
 ./build.sh
 ```
 
-Runs `podman build` (also works with Docker/buildx) and then
-`fix-uki-digest.sh`, which corrects the UKI's embedded composefs digest (see
-**Requirements / caveats**). Pass a tag as `./build.sh your/tag:here`.
-Re-running is safe — the fix step no-ops once the digest already matches.
+Runs `gen-secureboot-keys.sh` (generates local Secure Boot keys if missing),
+`podman build` with those keys as secrets (also works with Docker/buildx),
+then `fix-uki-digest.sh`, which corrects the UKI's embedded composefs digest
+and re-signs it (see **Requirements / caveats** and **Secure Boot signing**).
+Pass a tag as `./build.sh your/tag:here`. Re-running is safe — both steps
+no-op once keys exist / the digest already matches.
 
 ## How it works
 
@@ -90,8 +96,9 @@ only split out into a throwaway stage to feed `--kernel-dir`.
 2. **kernel** — `bootc container split-kernel-and-rootfs` into
    `/kernel/<kver>/`; only that directory is consumed. Never shipped.
 3. **sealed-uki** — `seal-uki` runs `bootc container ukify` against the
-   measured rootfs, embedding the composefs digest, unsigned
-   (`--seal-state unsealed`).
+   measured rootfs, embedding the composefs digest and signing the UKI
+   (`--seal-state sealed`) with the `secureboot_key`/`secureboot_cert`
+   build secrets.
 4. **final** — `FROM rootfs` + `finalize-uki` copies the UKI to
    `/boot/EFI/Linux/` (`/boot` is excluded from the digest). Then
    `bootc container lint`.
@@ -104,9 +111,13 @@ only split out into a throwaway stage to feed `--kernel-dir`.
   also ships in the final image (needed for `bootc upgrade`).
 - **Install target needs an fsverity-capable root fs** (ext4 or btrfs) — the
   build is strictly sealed, no `--allow-missing-verity`.
-- **Secure Boot** stays disabled (unsigned). To sign, change `sealed-uki` to
-  `--seal-state sealed` and mount `secureboot_key`/`secureboot_cert` secrets
-  via `podman build --secret`.
+- **`sbsign`, not `ukify`'s built-in `systemd-sbsign`.** `systemd-sbsign`'s
+  `verify()` unconditionally raises `NotImplementedError` in this systemd
+  version, and `ukify`'s `make_uki()` always calls it — so it can't be used
+  to build at all here. `sbsigntools` isn't packaged for CentOS Stream 10
+  itself, so the `rootfs` stage pulls it from EPEL 10 (removing
+  `epel-release` again afterward, so EPEL isn't enabled in the shipped
+  image).
 - **Digest mismatch bug, fixed by `fix-uki-digest.sh`.** `bootc container
   ukify` computes its digest via a directory walk of the extracted rootfs;
   `bootc install` verifies against the raw storage/layer-ingest digest. These
@@ -120,27 +131,55 @@ only split out into a throwaway stage to feed `--kernel-dir`.
   `--allow-missing-verity` does **not** work around this — the digest-match
   check in `bootc install` is unconditional. `fix-uki-digest.sh` instead
   re-computes the digest via `bootc container compute-composefs-digest-from-storage`
-  (the same view `bootc install` uses) and binary-patches that value into the
-  built UKI (`composefs=<sha512-hex>` is a fixed-length string, so the patch
-  doesn't change file size). `diagnose-digest.sh` compares both digest views
-  for debugging.
+  (the same view `bootc install` uses), patches that value into the built
+  UKI, strips the now-invalid signature (via `pefile` — patching content
+  invalidates it, and `sbsign` on an already-signed file appends a second
+  signature rather than replacing it, which OVMF doesn't reliably accept),
+  and re-signs cleanly. `diagnose-digest.sh` compares both digest views for
+  debugging.
+
+## Secure Boot signing
+
+`./gen-secureboot-keys.sh` generates a local PK/KEK/db key and cert set
+(`secureboot-keys/`, gitignored, never committed) — three independent
+self-signed certs, not a real PKI chain; fine for local QEMU/OVMF trust,
+not for any real Secure Boot deployment. It's a no-op if
+`secureboot-keys/db.key` already exists.
+
+- `db.key`/`db.crt` sign the UKI: `build.sh` passes them to `podman build
+  --secret` as `secureboot_key`/`secureboot_cert`, which `seal-uki
+  --seal-state sealed` uses.
+- `PK.crt`/`KEK.crt`/`db.crt`/`GUID.txt` are enrolled into a VM's firmware
+  by `bcvk libvirt run --secure-boot-keys secureboot-keys` (see **Run as a
+  local VM**), so that VM's Secure Boot trusts the signed UKI.
+
+Verify the signature directly, independent of booting (`sbverify` only
+exists inside the image, so run it via `podman`):
+
+```sh
+cid=$(podman create localhost/centos-bootc-composefs:stream10)
+podman cp "$cid:/boot/EFI/Linux/$(podman run --rm localhost/centos-bootc-composefs:stream10 sh -c 'ls /boot/EFI/Linux')" /tmp/uki.efi
+podman rm -f "$cid"
+podman run --rm -v /tmp/uki.efi:/uki.efi:ro -v "$(pwd)/secureboot-keys/db.crt":/db.crt:ro \
+  localhost/centos-bootc-composefs:stream10 sbverify --cert /db.crt /uki.efi
+```
 
 ## Run as a local VM (bcvk)
 
 `--filesystem ext4` is required (fsverity; `xfs`, the default, doesn't
-support it). `--firmware uefi-insecure` is required because the UKI is
-unsigned and `bcvk`'s default firmware has Secure Boot enabled (without it:
-`Access Denied -- rejected probably by Secure Boot`, stuck at the boot
-manager).
+support it). `--secure-boot-keys secureboot-keys` is required so `bcvk`
+enrolls the local Secure Boot keys into the VM's firmware (`bcvk`'s default
+firmware, `uefi-secure`, otherwise only trusts Microsoft's keys, and this
+UKI isn't signed by those — see **Secure Boot signing**).
 
 ```sh
 bcvk libvirt run --name cfs-test --memory 4096 --cpus 2 \
-  --filesystem ext4 --firmware uefi-insecure \
+  --filesystem ext4 --secure-boot-keys secureboot-keys \
   localhost/centos-bootc-composefs:stream10
 
 # re-create (replaces an existing VM of the same name):
 bcvk libvirt run --name cfs-test --memory 4096 --cpus 2 \
-  --filesystem ext4 --firmware uefi-insecure --replace \
+  --filesystem ext4 --secure-boot-keys secureboot-keys --replace \
   localhost/centos-bootc-composefs:stream10
 
 # manage it afterwards:
@@ -171,6 +210,15 @@ bcvk libvirt ssh cfs-test
 > sudo udevadm trigger --name-match=kvm
 > ```
 
+> **Secure Boot enforcement may not work in nested virtualization** (e.g.
+> WSL2, Codespaces, Azure VMs): OVMF's Secure Boot firmware depends on
+> emulated SMM, which is unreliable in nested KVM
+> ([bcvk#145](https://github.com/bootc-dev/bcvk/issues/145)). Symptoms range
+> from a hard KVM crash to a valid signature being rejected
+> (`Access Denied -- rejected probably by Secure Boot`) despite correct
+> enrollment. This is independent of this image's signing, which can be
+> verified without booting — see **Secure Boot signing**.
+
 `bcvk ephemeral run` boots the container directly over virtiofs, skipping
 `bootc install`/UKI/composefs entirely, and attaches no GPU/display device —
 useful for a quick shell (`bcvk ephemeral ssh`), not for the sealed boot
@@ -198,11 +246,16 @@ Viewing it requires a graphical QEMU display — the serial console
 
 ```sh
 bcvk libvirt run --name qt-demo --memory 4096 --cpus 2 \
-  --filesystem ext4 --firmware uefi-insecure --graphical-console --replace \
-  localhost/centos-bootc-composefs:stream10
+  --filesystem ext4 --secure-boot-keys secureboot-keys --graphical-console \
+  --replace localhost/centos-bootc-composefs:stream10
 
 virt-viewer --connect qemu:///system qt-demo
 ```
+
+If Secure Boot enforcement fails in your environment (see the nested-virt
+note above), `--firmware uefi-insecure` in place of `--secure-boot-keys`
+boots the same signed image with enforcement off — fine for viewing the
+demo.
 
 Swap `qtdemo/main.cpp` for your own Qt Widgets app and rebuild.
 
@@ -220,8 +273,10 @@ podman run --rm --privileged --pid=host \
 ```
 
 `bootc` selects the composefs backend automatically because the image
-contains a UKI. `--filesystem ext4` still applies. Real hardware needs
-Secure Boot disabled in firmware settings (the UKI is unsigned).
+contains a UKI. `--filesystem ext4` still applies. The UKI is signed with
+this repo's own local key (`secureboot-keys/db.crt`), which real hardware
+doesn't trust by default — either disable Secure Boot in firmware settings,
+or enroll `secureboot-keys/db.crt` into the machine's own MokManager/db.
 
 ## Persistent logs (`/var` stateless, `/var/log` persistent)
 

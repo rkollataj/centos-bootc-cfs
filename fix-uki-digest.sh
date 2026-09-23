@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Corrects the composefs= digest embedded in an already-built image's UKI.
+# Corrects the composefs= digest embedded in an already-built image's UKI,
+# then re-signs it (patching invalidates the Secure Boot signature).
 #
 # `bootc container ukify` (used by `seal-uki` during the build) computes its
 # digest via a *directory walk* of the extracted rootfs; `bootc install`
@@ -14,19 +15,24 @@
 #
 # This script re-computes the digest the SAME way `bootc install` does (the
 # storage/layer-ingest view) and binary-patches it into the already-built
-# UKI in place -- the `composefs=<hex>` string is a fixed-length SHA-512 hex
-# digest, so patching never changes the file's size or needs re-signing --
-# then re-commits the image under the same tag. The result is genuinely,
-# correctly sealed: this is a real fix, not a workaround that weakens
-# sealing (compare to `--allow-missing-verity`, which does NOT help here --
-# see README).
+# UKI -- the `composefs=<hex>` string is a fixed-length SHA-512 hex digest,
+# so patching never changes the file's size. Patching invalidates the
+# existing Secure Boot signature, so the script also strips it (via
+# `pefile`, inside the image) and re-signs cleanly with the local Secure
+# Boot key -- `sbsign` on an already-signed file APPENDS a second signature
+# rather than replacing the first, and OVMF's verifier doesn't reliably
+# accept multi-signed PE files, so a clean single signature is what
+# actually boots. The result is genuinely, correctly sealed AND validly
+# signed: a real fix, not a workaround that weakens sealing (compare to
+# `--allow-missing-verity`, which does NOT help here -- see README).
 #
 # Safe to re-run: it's a no-op if the embedded digest already matches.
 #
-# Usage: ./fix-uki-digest.sh [image[:tag]]
+# Usage: ./fix-uki-digest.sh [image[:tag]] [key-dir]
 set -euo pipefail
 
 IMG="${1:-localhost/centos-bootc-composefs:stream10}"
+KEYDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${2:-secureboot-keys}"
 
 echo "== image: $IMG"
 
@@ -56,9 +62,15 @@ echo ">> extracting UKI to inspect the embedded digest..."
 cid="$(podman create "$IMG")"
 podman cp "$cid:$UKI_PATH" "$OUT/uki.efi"
 
-RESULT="$(python3 - "$OUT/uki.efi" "$CORRECT" "$OUT/uki-fixed.efi" <<'PYEOF'
+echo ">> patching digest and stripping any existing signature (inside the image, via pefile)..."
+RESULT="$(podman run --rm -i -v "$OUT":/work:Z "$IMG" python3 - "$CORRECT" <<'PYEOF'
 import re, sys
-path, correct, outpath = sys.argv[1], sys.argv[2].encode(), sys.argv[3]
+import pefile
+
+correct = sys.argv[1].encode()
+path = "/work/uki.efi"
+outpath = "/work/uki-unsigned.efi"
+
 data = bytearray(open(path, "rb").read())
 m = re.search(rb"composefs=(\??)([0-9a-f]{128})", data)
 if not m:
@@ -74,6 +86,18 @@ if count != 1:
     sys.exit(1)
 idx = data.find(embedded)
 data[idx:idx + len(embedded)] = correct
+
+# Strip any existing Authenticode signature: the security data directory's
+# VirtualAddress is a file offset (not an RVA) pointing at the trailing
+# WIN_CERTIFICATE table; truncate it away and zero the directory entry.
+pe = pefile.PE(data=bytes(data), fast_load=True)
+sec_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]]
+if sec_dir.Size:
+    dir_offset = sec_dir.get_file_offset()
+    data[dir_offset:dir_offset + 8] = b"\x00" * 8
+    data = data[:sec_dir.VirtualAddress]
+pe.close()
+
 with open(outpath, "wb") as f:
     f.write(data)
 print(f"PATCHED {embedded.decode()} -> {correct.decode()}")
@@ -94,7 +118,20 @@ case "$RESULT" in
         ;;
 esac
 
-echo ">> writing patched UKI back and committing..."
+echo ">> signing with $KEYDIR/db.{key,crt}..."
+if [ ! -f "$KEYDIR/db.key" ]; then
+    echo "ERROR: $KEYDIR/db.key not found -- run ./gen-secureboot-keys.sh first" >&2
+    exit 1
+fi
+podman run --rm \
+    -v "$OUT/uki-unsigned.efi":/in.efi:ro \
+    -v "$KEYDIR/db.key":/db.key:ro \
+    -v "$KEYDIR/db.crt":/db.crt:ro \
+    -v "$OUT":/out:Z \
+    "$IMG" \
+    sbsign --key /db.key --cert /db.crt --output /out/uki-fixed.efi /in.efi
+
+echo ">> writing patched+resigned UKI back and committing..."
 podman cp "$OUT/uki-fixed.efi" "$cid:$UKI_PATH"
 podman commit "$cid" "$IMG" >/dev/null
 echo ">> done. Re-verify with: ./diagnose-digest.sh $IMG"

@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 #
-# Minimal CentOS Stream 10 bootc image with a SEALED composefs UKI backend.
+# Minimal CentOS Stream 10 bootc image with a SEALED, SIGNED composefs UKI
+# backend.
 #
 # This mirrors bootc's own maintained sealed-UKI recipe (the repo-root
 # Dockerfile + contrib/packaging/{seal-uki,finalize-uki}) rather than the
@@ -22,8 +23,10 @@
 #     --allow-missing-verity (we OMIT it, so the digest is enforced; the
 #     install-target root fs must support fsverity, i.e. ext4 or btrfs).
 #   * signing (Secure Boot)                     -> `seal-uki --seal-state`;
-#     we use `unsealed` = UNSIGNED, so no keys are needed.
-# Net result: an fsverity-sealed, unsigned UKI.
+#     we use `sealed` = SIGNED, with a local, gitignored key/cert pair
+#     (`./gen-secureboot-keys.sh`, run automatically by `build.sh`) passed in
+#     as build secrets. See README ("Secure Boot signing").
+# Net result: an fsverity-sealed, Secure Boot-signed UKI.
 #
 # KNOWN BUILD-TIME BUG, WORKED AROUND BY `fix-uki-digest.sh`: `bootc container
 # ukify` (in the `sealed-uki` stage) computes its digest via a directory walk
@@ -65,6 +68,13 @@ COPY bootc-copr.repo /etc/yum.repos.d/_bootc-copr.repo
 
 # Sealing helper scripts (copied verbatim from bootc contrib/packaging).
 COPY seal-uki finalize-uki /usr/bin/
+
+# `seal-uki --seal-state sealed` (used below) signs the UKI with `sbsign`,
+# which isn't packaged for CentOS Stream 10 itself (`ukify`'s alternative,
+# --signtool systemd-sbsign, is broken in this systemd version: its
+# verify() unconditionally raises NotImplementedError, and make_uki() always
+# calls it). sbsigntools is in EPEL 10; the epel-release package is removed
+# again right after so EPEL isn't enabled in the shipped image.
 
 # Swap the GRUB/bootupd stack for systemd-boot (the composefs UKI bootloader),
 # upgrade bootc, add the ukify tool, and scrub dnf/runtime state in the SAME
@@ -130,6 +140,9 @@ RUN set -eu; \
     dnf -y remove bootupd 2>/dev/null || true; \
     dnf -y upgrade bootc; \
     dnf -y install systemd-boot-unsigned systemd-ukify; \
+    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm; \
+    dnf -y install sbsigntools; \
+    dnf -y remove epel-release; \
     mkdir -p /usr/lib/composefs; \
     printf '[etc]\ntransient = true\n' \
         > /usr/lib/composefs/setup-root-conf.toml; \
@@ -215,12 +228,17 @@ RUN mkdir /kernel && \
     bootc container split-kernel-and-rootfs --rootfs / --output /kernel
 
 ########################################################################
-# Stage `sealed-uki`: build the sealed (but unsigned) UKI.
+# Stage `sealed-uki`: build the sealed, Secure Boot-signed UKI.
 #
 # `seal-uki` runs `bootc container ukify`, which computes the composefs digest
-# of --target, embeds it in the cmdline, and invokes ukify. --seal-state
-# unsealed => no Secure Boot signing (no secrets needed). No
+# of --target, embeds it in the cmdline, and invokes ukify. No
 # --allow-missing-verity => the composefs digest is strictly enforced at boot.
+#
+# --seal-state sealed signs the UKI with the `secureboot_key`/`secureboot_cert`
+# build secrets (the local "db" key/cert from `gen-secureboot-keys.sh`, passed
+# via `build.sh`'s `podman build --secret`). Those never touch the image
+# itself -- BuildKit/buildah secrets are only mounted into this RUN's
+# ephemeral container, not committed to any layer.
 #
 # CAVEAT: the digest `ukify` computes here (a directory walk of the extracted
 # rootfs) is known to disagree with what `bootc install` verifies against (the
@@ -234,14 +252,17 @@ RUN mkdir /kernel && \
 ########################################################################
 FROM rootfs AS sealed-uki
 RUN --mount=type=bind,from=rootfs,src=/,target=/run/target \
-    --mount=type=bind,from=kernel,src=/kernel,target=/run/kernel <<'EORUN'
+    --mount=type=bind,from=kernel,src=/kernel,target=/run/kernel \
+    --mount=type=secret,id=secureboot_key \
+    --mount=type=secret,id=secureboot_cert <<'EORUN'
 set -euo pipefail
 kver="$(ls /run/kernel)"
 /usr/bin/seal-uki \
     --target /run/target \
     --output /out \
     --kernel-dir "/run/kernel/${kver}" \
-    --seal-state unsealed
+    --seal-state sealed \
+    --secrets /run/secrets
 EORUN
 
 ########################################################################
